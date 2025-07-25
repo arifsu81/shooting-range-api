@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-import mysql.connector
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import os
 import uuid
 from datetime import datetime
@@ -20,32 +21,100 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database configuration
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST', 'sql.freedb.tech'),
-    'user': os.getenv('DB_USER', 'u251802700_userswsc'),
-    'password': os.getenv('DB_PASSWORD', '5VWA;]b4^J'),
-    'database': os.getenv('DB_NAME', 'u251802700_swsc'),
-    'port': int(os.getenv('DB_PORT', '3306'))
-}
-
-# AWS Configuration
-AWS_CONFIG = {
-    'access_key': os.getenv('AWS_ACCESS_KEY_ID'),
-    'secret_key': os.getenv('AWS_SECRET_ACCESS_KEY'),
-    'region': os.getenv('AWS_REGION', 'us-east-1'),
-    'bucket': os.getenv('S3_BUCKET_NAME')
-}
+# Database configuration - PostgreSQL
+DATABASE_URL = os.getenv('DATABASE_URL')  # Railway auto-provides this
 
 def get_db_connection():
-    """Create database connection"""
+    """Create PostgreSQL database connection"""
     try:
-        connection = mysql.connector.connect(**DB_CONFIG)
+        connection = psycopg2.connect(DATABASE_URL)
         return connection
     except Exception as e:
         print(f"Database connection error: {e}")
         raise HTTPException(status_code=500, detail="Database connection failed")
 
+def init_database():
+    """Initialize database tables"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Create tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS lanes (
+                id VARCHAR(36) PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                camera_id VARCHAR(100),
+                target_type VARCHAR(50) NOT NULL,
+                scoring_system VARCHAR(50) NOT NULL,
+                distance_meters INTEGER DEFAULT 25,
+                caliber VARCHAR(20),
+                active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id VARCHAR(36) PRIMARY KEY,
+                lane_id VARCHAR(36) REFERENCES lanes(id),
+                shooter_name VARCHAR(100),
+                start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                end_time TIMESTAMP NULL,
+                total_shots INTEGER DEFAULT 0,
+                total_score INTEGER DEFAULT 0,
+                status VARCHAR(20) DEFAULT 'active'
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS shots (
+                id VARCHAR(36) PRIMARY KEY,
+                session_id VARCHAR(36) REFERENCES sessions(id),
+                lane_id VARCHAR(36) REFERENCES lanes(id),
+                shot_number INTEGER,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                coordinates_x FLOAT,
+                coordinates_y FLOAT,
+                score INTEGER,
+                zone VARCHAR(50),
+                confidence FLOAT,
+                s3_image_url VARCHAR(500),
+                target_type VARCHAR(50),
+                scoring_system VARCHAR(50)
+            )
+        """)
+        
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_lane_status ON sessions(lane_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_session_time ON shots(session_id, timestamp)")
+        
+        # Insert sample data if lanes table is empty
+        cursor.execute("SELECT COUNT(*) FROM lanes")
+        count = cursor.fetchone()[0]
+        
+        if count == 0:
+            sample_lanes = [
+                ('lane-001', 'Lane 1 - Precision', 'camera_1', 'bullseye', 'issf', 25, '.22'),
+                ('lane-002', 'Lane 2 - Tactical', 'camera_2', 'silhouette', 'ipsc', 15, '9mm'),
+                ('lane-003', 'Lane 3 - Training', 'camera_3', 'bullseye', 'issf', 10, '.177')
+            ]
+            
+            for lane_data in sample_lanes:
+                cursor.execute("""
+                    INSERT INTO lanes (id, name, camera_id, target_type, scoring_system, distance_meters, caliber)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, lane_data)
+        
+        conn.commit()
+        conn.close()
+        print("✅ Database initialized successfully")
+        
+    except Exception as e:
+        print(f"❌ Database initialization error: {e}")
+        raise
+
+# Pydantic models
 class LaneCreate(BaseModel):
     name: str
     camera_id: str
@@ -70,15 +139,25 @@ class ShotCreate(BaseModel):
     target_type: str = ""
     scoring_system: str = ""
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    try:
+        init_database()
+        print("🚀 API startup completed")
+    except Exception as e:
+        print(f"❌ Startup failed: {e}")
+
 @app.get("/")
 def read_root():
     return {
         "message": "🎯 SWSC Shooting Range API",
         "version": "1.0.0",
         "status": "online",
+        "database": "PostgreSQL",
         "endpoints": [
             "/api/lanes",
-            "/api/sessions",
+            "/api/sessions", 
             "/api/shots",
             "/health"
         ]
@@ -96,6 +175,7 @@ def health_check():
         return {
             "status": "healthy",
             "database": "connected",
+            "database_type": "PostgreSQL",
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
@@ -107,7 +187,7 @@ def get_lanes():
     """Get all active lanes"""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         cursor.execute("""
             SELECT l.*, 
@@ -122,14 +202,14 @@ def get_lanes():
                 GROUP BY lane_id
             ) active_s ON l.id = active_s.lane_id
             WHERE l.active = TRUE
-            GROUP BY l.id
+            GROUP BY l.id, active_s.session_count
             ORDER BY l.name
         """)
         
         lanes = cursor.fetchall()
         conn.close()
         
-        return {"lanes": lanes, "count": len(lanes)}
+        return {"lanes": [dict(lane) for lane in lanes], "count": len(lanes)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -161,7 +241,7 @@ def get_lane(lane_id: str):
     """Get specific lane details"""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         cursor.execute("SELECT * FROM lanes WHERE id = %s", (lane_id,))
         lane = cursor.fetchone()
@@ -170,7 +250,7 @@ def get_lane(lane_id: str):
             raise HTTPException(status_code=404, detail="Lane not found")
         
         conn.close()
-        return {"lane": lane}
+        return {"lane": dict(lane)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -180,7 +260,7 @@ def get_active_session(lane_id: str):
     """Get active session for lane"""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         cursor.execute("""
             SELECT s.*, l.name as lane_name
@@ -194,7 +274,7 @@ def get_active_session(lane_id: str):
         session = cursor.fetchone()
         conn.close()
         
-        return {"session": session}
+        return {"session": dict(session) if session else None}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -208,7 +288,7 @@ def create_session(session: SessionCreate):
         # End any active session for this lane
         cursor.execute("""
             UPDATE sessions 
-            SET status = 'completed', end_time = NOW()
+            SET status = 'completed', end_time = CURRENT_TIMESTAMP
             WHERE lane_id = %s AND status = 'active'
         """, (session.lane_id,))
         
@@ -235,7 +315,7 @@ def end_session(session_id: str):
         
         cursor.execute("""
             UPDATE sessions 
-            SET status = 'completed', end_time = NOW()
+            SET status = 'completed', end_time = CURRENT_TIMESTAMP
             WHERE id = %s
         """, (session_id,))
         
@@ -293,7 +373,7 @@ def get_session_shots(session_id: str, limit: int = 20):
     """Get shots for a session"""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         cursor.execute("""
             SELECT * FROM shots 
@@ -305,7 +385,7 @@ def get_session_shots(session_id: str, limit: int = 20):
         shots = cursor.fetchall()
         conn.close()
         
-        return {"shots": shots, "count": len(shots)}
+        return {"shots": [dict(shot) for shot in shots], "count": len(shots)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -315,22 +395,22 @@ def get_dashboard_stats():
     """Get dashboard statistics"""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor()
         
         # Total lanes
-        cursor.execute("SELECT COUNT(*) as count FROM lanes WHERE active = TRUE")
-        total_lanes = cursor.fetchone()['count']
+        cursor.execute("SELECT COUNT(*) FROM lanes WHERE active = TRUE")
+        total_lanes = cursor.fetchone()[0]
         
         # Active sessions
-        cursor.execute("SELECT COUNT(*) as count FROM sessions WHERE status = 'active'")
-        active_sessions = cursor.fetchone()['count']
+        cursor.execute("SELECT COUNT(*) FROM sessions WHERE status = 'active'")
+        active_sessions = cursor.fetchone()[0]
         
         # Today's shots
         cursor.execute("""
-            SELECT COUNT(*) as count FROM shots 
-            WHERE DATE(timestamp) = CURDATE()
+            SELECT COUNT(*) FROM shots 
+            WHERE DATE(timestamp) = CURRENT_DATE
         """)
-        today_shots = cursor.fetchone()['count']
+        today_shots = cursor.fetchone()[0]
         
         # Recent activity
         cursor.execute("""
@@ -351,7 +431,14 @@ def get_dashboard_stats():
                 "active_sessions": active_sessions,
                 "today_shots": today_shots
             },
-            "recent_activity": recent_activity
+            "recent_activity": [
+                {
+                    "shooter_name": activity[0],
+                    "lane_name": activity[1], 
+                    "start_time": activity[2].isoformat() if activity[2] else None
+                }
+                for activity in recent_activity
+            ]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
