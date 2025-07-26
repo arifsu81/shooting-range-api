@@ -14,8 +14,7 @@ import time
 import base64
 import io
 from PIL import Image
-import numpy as np
-import cv2
+import random
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +41,7 @@ if not DATABASE_URL:
 AWS_REGION = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
 S3_BUCKET = os.getenv('S3_BUCKET_NAME', 'swsc-shooting-images')
 
-# Initialize AWS clients
+# Initialize AWS clients with error handling
 try:
     rekognition = boto3.client('rekognition', region_name=AWS_REGION)
     s3 = boto3.client('s3', region_name=AWS_REGION)
@@ -66,7 +65,7 @@ def get_db_connection():
             logger.error(f"❌ Database connection attempt {attempt + 1} failed: {e}")
             if attempt == max_retries - 1:
                 raise HTTPException(status_code=500, detail=f"Database connection failed after {max_retries} attempts: {str(e)}")
-            time.sleep(1)  # Wait 1 second before retry
+            time.sleep(1)
 
 def init_database():
     """Initialize database tables with proper error handling"""
@@ -128,7 +127,7 @@ def init_database():
                 target_type VARCHAR(50),
                 scoring_system VARCHAR(50),
                 holes_detected INTEGER DEFAULT 1,
-                analysis_data JSON,
+                analysis_data TEXT,
                 CONSTRAINT fk_shots_session FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 CONSTRAINT fk_shots_lane FOREIGN KEY (lane_id) REFERENCES lanes(id) ON DELETE CASCADE
             )
@@ -184,7 +183,7 @@ async def add_cache_headers(request: Request, call_next):
         response.headers["Expires"] = "0"
     else:
         # Static content - longer cache
-        response.headers["Cache-Control"] = "public, max-age=300"  # 5 minutes
+        response.headers["Cache-Control"] = "public, max-age=300"
     
     # Add CORS headers for all responses
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -263,7 +262,7 @@ async def upload_to_s3(image_data: bytes, session_id: str) -> str:
         return None
 
 async def analyze_target_image(image_data: bytes, target_type: str) -> dict:
-    """Analyze target image using AWS Rekognition and custom logic"""
+    """Analyze target image using AWS Rekognition (simplified without OpenCV)"""
     try:
         # Try AWS Rekognition first
         if rekognition:
@@ -271,167 +270,66 @@ async def analyze_target_image(image_data: bytes, target_type: str) -> dict:
                 response = rekognition.detect_objects(
                     Image={'Bytes': image_data},
                     MaxLabels=10,
-                    MinConfidence=70
+                    MinConfidence=60
                 )
                 logger.info("✅ AWS Rekognition analysis completed")
+                
+                # Simple analysis based on detected objects
+                objects = response.get('ObjectTypes', [])
+                confidence = 0.8 if objects else 0.5
+                
             except Exception as e:
-                logger.warning(f"⚠️ AWS Rekognition failed, using fallback: {e}")
+                logger.warning(f"⚠️ AWS Rekognition failed, using mock analysis: {e}")
+                confidence = 0.5
+        else:
+            confidence = 0.5
         
-        # Process image with OpenCV for bullet hole detection
-        np_array = np.frombuffer(image_data, np.uint8)
-        image = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
-        
-        if image is None:
-            raise Exception("Could not decode image")
-        
-        # Custom bullet hole detection logic
-        bullet_holes = detect_bullet_holes(image)
-        
-        # Calculate score based on target type and bullet hole positions
-        score_result = calculate_score(bullet_holes, target_type, image.shape)
+        # Use mock analysis for scoring (will be replaced with actual CV later)
+        score_result = mock_analysis(target_type)
+        score_result['confidence'] = confidence
         
         return score_result
         
     except Exception as e:
         logger.error(f"❌ Image analysis error: {e}")
-        # Fallback to mock analysis if everything fails
         return mock_analysis(target_type)
-
-def detect_bullet_holes(image):
-    """Detect bullet holes using OpenCV"""
-    try:
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Apply Gaussian blur
-        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-        
-        # Use HoughCircles to detect circular bullet holes
-        circles = cv2.HoughCircles(
-            blurred,
-            cv2.HOUGH_GRADIENT,
-            dp=1,
-            minDist=30,
-            param1=50,
-            param2=30,
-            minRadius=3,
-            maxRadius=25
-        )
-        
-        bullet_holes = []
-        if circles is not None:
-            circles = np.round(circles[0, :]).astype("int")
-            for (x, y, r) in circles:
-                bullet_holes.append({
-                    'x': int(x),
-                    'y': int(y),
-                    'radius': int(r),
-                    'confidence': min(0.9, 0.6 + (r / 50))  # Confidence based on radius
-                })
-        
-        logger.info(f"🔍 Detected {len(bullet_holes)} bullet holes")
-        return bullet_holes
-        
-    except Exception as e:
-        logger.error(f"❌ Bullet hole detection error: {e}")
-        return []
-
-def calculate_score(bullet_holes, target_type: str, image_shape) -> dict:
-    """Calculate score based on bullet hole positions and target type"""
-    try:
-        if not bullet_holes:
-            return {
-                'score': 0,
-                'position': {'x': 50, 'y': 50},  # Center default
-                'confidence': 0.0,
-                'holes_detected': 0,
-                'zone': 'miss'
-            }
-        
-        # Get the most recent/prominent bullet hole
-        latest_hole = max(bullet_holes, key=lambda h: h['confidence'])
-        
-        # Convert pixel position to percentage
-        x_percent = (latest_hole['x'] / image_shape[1]) * 100
-        y_percent = (latest_hole['y'] / image_shape[0]) * 100
-        
-        # Calculate score based on target type and position
-        score, zone = calculate_target_score(x_percent, y_percent, target_type)
-        
-        return {
-            'score': score,
-            'position': {'x': x_percent, 'y': y_percent},
-            'confidence': latest_hole['confidence'],
-            'holes_detected': len(bullet_holes),
-            'zone': zone,
-            'all_holes': bullet_holes
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Score calculation error: {e}")
-        return mock_analysis(target_type)
-
-def calculate_target_score(x_percent: float, y_percent: float, target_type: str) -> tuple:
-    """Calculate score based on position and target type"""
-    # Calculate distance from center
-    center_x, center_y = 50, 50
-    distance = np.sqrt((x_percent - center_x)**2 + (y_percent - center_y)**2)
-    
-    if target_type == 'bullseye':
-        # Bullseye scoring (1-10 points)
-        if distance <= 2:    return 10, "X-ring"    # X-ring
-        elif distance <= 5:  return 9, "9-ring"     # 9-ring
-        elif distance <= 8:  return 8, "8-ring"     # 8-ring
-        elif distance <= 12: return 7, "7-ring"     # 7-ring
-        elif distance <= 16: return 6, "6-ring"     # 6-ring
-        elif distance <= 20: return 5, "5-ring"     # 5-ring
-        elif distance <= 25: return 4, "4-ring"     # 4-ring
-        elif distance <= 30: return 3, "3-ring"     # 3-ring
-        elif distance <= 35: return 2, "2-ring"     # 2-ring
-        elif distance <= 40: return 1, "1-ring"     # 1-ring
-        else: return 0, "miss"                       # Miss
-        
-    elif target_type == 'silhouette':
-        # Silhouette scoring (hit/miss)
-        if distance <= 30:
-            return 5, "hit"  # Hit
-        else:
-            return 0, "miss"  # Miss
-            
-    elif target_type == 'hostage':
-        # Hostage scenario scoring
-        if distance <= 15:
-            return 5, "target_hit"   # Hit target
-        elif distance <= 25:
-            return 2, "marginal"     # Marginal hit
-        elif distance <= 35:
-            return -5, "hostage_hit" # Hit hostage (penalty)
-        else:
-            return 0, "miss"         # Miss
-    
-    return 0, "unknown"
 
 def mock_analysis(target_type: str) -> dict:
-    """Fallback mock analysis when real detection fails"""
-    import random
+    """Mock analysis for development (will be replaced with real CV)"""
     
-    scoring = {
-        'bullseye': lambda: (random.randint(1, 10), random.choice(['X-ring', '9-ring', '8-ring', '7-ring'])),
-        'silhouette': lambda: (5 if random.random() > 0.3 else 0, 'hit' if random.random() > 0.3 else 'miss'),
-        'hostage': lambda: random.choice([(5, 'target_hit'), (2, 'marginal'), (-5, 'hostage_hit'), (0, 'miss')])
-    }
+    # Simulate different scoring based on target type
+    if target_type == 'bullseye':
+        score = random.choice([10, 9, 8, 7, 6, 5, 4, 3, 2, 1])
+        zones = ['X-ring', '9-ring', '8-ring', '7-ring', '6-ring', '5-ring', '4-ring', '3-ring', '2-ring', '1-ring']
+        zone = zones[10 - score] if score <= 10 else 'miss'
+    elif target_type == 'silhouette':
+        score = 5 if random.random() > 0.3 else 0
+        zone = 'hit' if score > 0 else 'miss'
+    elif target_type == 'hostage':
+        choices = [(5, 'target_hit'), (2, 'marginal'), (-5, 'hostage_hit'), (0, 'miss')]
+        score, zone = random.choice(choices)
+    else:
+        score = random.randint(0, 10)
+        zone = 'unknown'
     
-    score, zone = scoring.get(target_type, lambda: (0, 'miss'))()
+    # Generate random but realistic position
+    if score > 7:  # Good shots closer to center
+        x = random.uniform(40, 60)
+        y = random.uniform(40, 60)
+    elif score > 3:  # Average shots
+        x = random.uniform(25, 75)
+        y = random.uniform(25, 75)
+    else:  # Poor shots
+        x = random.uniform(10, 90)
+        y = random.uniform(10, 90)
     
     return {
         'score': score,
-        'position': {
-            'x': random.uniform(30, 70),
-            'y': random.uniform(30, 70)
-        },
+        'position': {'x': x, 'y': y},
         'confidence': random.uniform(0.6, 0.9),
         'holes_detected': 1,
-        'zone': zone
+        'zone': zone,
+        'analysis_method': 'mock'  # Indicator this is mock data
     }
 
 def calculate_shooting_analytics(scores: List[float], positions: List[tuple]) -> dict:
@@ -466,14 +364,14 @@ def calculate_shooting_analytics(scores: List[float], positions: List[tuple]) ->
                 for j in range(i + 1, len(positions)):
                     dx = positions[i][0] - positions[j][0]
                     dy = positions[i][1] - positions[j][1]
-                    distance = np.sqrt(dx**2 + dy**2)
+                    distance = (dx**2 + dy**2)**0.5  # Simple distance without numpy
                     max_distance = max(max_distance, distance)
             group_size = max_distance
         
         # Calculate consistency (inverse of standard deviation)
         if total_shots > 1:
             variance = sum((s - average_score)**2 for s in scores) / total_shots
-            std_dev = np.sqrt(variance)
+            std_dev = variance**0.5  # Simple sqrt without numpy
             consistency_score = max(0, 10 - std_dev)
         else:
             consistency_score = 10
@@ -483,7 +381,7 @@ def calculate_shooting_analytics(scores: List[float], positions: List[tuple]) ->
         for i in range(1, len(positions)):
             dx = positions[i][0] - positions[i-1][0]
             dy = positions[i][1] - positions[i-1][1]
-            distance = np.sqrt(dx**2 + dy**2)
+            distance = (dx**2 + dy**2)**0.5
             shot_distances.append(distance)
         
         # Calculate spreads
@@ -523,7 +421,6 @@ async def startup_event():
         logger.info("🎉 API startup completed successfully")
     except Exception as e:
         logger.error(f"❌ Startup failed: {e}")
-        # Don't raise exception to allow API to start even if DB has issues
 
 @app.get("/")
 def read_root():
@@ -533,13 +430,14 @@ def read_root():
         "status": "online",
         "database": "PostgreSQL",
         "aws_integration": "enabled" if rekognition and s3 else "disabled",
+        "computer_vision": "mock_mode",  # Indicates using mock CV
         "timestamp": datetime.now().isoformat(),
         "features": {
             "lanes": "✅ Active",
             "sessions": "✅ Active", 
             "shots": "✅ Active",
             "camera": "✅ Active",
-            "ai_scoring": "✅ Active",
+            "ai_scoring": "✅ Mock Mode",
             "analytics": "✅ Active"
         },
         "endpoints": {
@@ -571,6 +469,7 @@ def health_check():
             "database_type": "PostgreSQL",
             "aws": aws_status,
             "s3_bucket": S3_BUCKET if s3 else "not_configured",
+            "computer_vision": "mock_mode",
             "server_time": result[1].isoformat() if result[1] else None,
             "test_query": "passed",
             "timestamp": datetime.now().isoformat()
@@ -876,7 +775,7 @@ async def analyze_shot_image(shot_data: ShotAnalyze):
         # Upload to S3 for storage
         image_url = await upload_to_s3(image_data, shot_data.session_id)
         
-        # Analyze with AWS Rekognition and OpenCV
+        # Analyze with AWS Rekognition (simplified)
         analysis_result = await analyze_target_image(image_data, shot_data.target_type)
         
         # Record the shot
@@ -900,7 +799,7 @@ async def analyze_shot_image(shot_data: ShotAnalyze):
             "image_url": image_url
         }
         
-        logger.info(f"✅ Shot analyzed: {analysis_result['score']} points, {analysis_result['holes_detected']} holes detected")
+        logger.info(f"✅ Shot analyzed: {analysis_result['score']} points ({analysis_result.get('analysis_method', 'aws')} method)")
         return result
         
     except HTTPException:
